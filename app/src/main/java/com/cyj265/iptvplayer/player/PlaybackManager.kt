@@ -53,6 +53,9 @@ import com.cyj265.iptvplayer.player.DecoderHealthCheck
  *   不再直接提示"请手动换线路"，而是等待 1.5s 原地重试当前线路一次；重新就绪即视为
  *   恢复成功继续播放，重试仍失败才交回原有 autoFail() 继续尝试下一条线路。
  *   新的自动换源周期从"发生故障的线路"开始计一圈，回到该线路即停止，不会无限循环。
+ * - V1.1：同一线路"驻留周期"内只有一次中途恢复机会（恢复成功后再次断流直接切下一条线路，
+ *   换台/真正换线路才重新给机会）；中途恢复只移除自己的延迟任务，不影响 retryHandler 上
+ *   解码重试 / 软解降级 / 单线路网络重试等既有任务。
  *
  * 自动识别 HLS / 渐进式流，与 TiviMate 同源的内核家族，对标准 HLS 支持最好。
  *
@@ -93,13 +96,26 @@ class PlaybackManager(
     private val retryHandler = Handler(Looper.getMainLooper())
     private val sourceTimeoutHandler = Handler(Looper.getMainLooper())
     private var sourceTimeoutMs: Long = 10_000L
-    // ---------- 播放中途断流恢复（V1） ----------
+    // ---------- 播放中途断流恢复（V1 / V1.1） ----------
     /** 中途断流后，原地重试当前线路前的等待时间 */
     private val midPlaybackRecoveryDelayMs = 1_500L
     /** 是否已安排/正在对当前线路做一次中途断流恢复重试 */
     private var midPlaybackRecoveryPending = false
     /** 中途断流恢复针对的线路序号（换台 / 手动换线路后用于作废旧的延迟重试任务） */
     private var midPlaybackRecoverySourceIndex = -1
+    /**
+     * V1.1：当前线路"驻留周期"内是否已用掉唯一一次中途恢复机会。
+     * 只有真正开始新线路 / 新频道（playCurrentSource）才重新给予机会；
+     * STATE_READY 恢复成功只结束 pending，不清这个标记（否则同一线路可无限次原地恢复）。
+     * 注意：retryPlay() 属于同一线路的恢复，不重置此标记。
+     */
+    private var midPlaybackRecoveryUsedForCurrentSource = false
+    /**
+     * V1.1：中途恢复自己的延迟任务引用。清理时只 removeCallbacks(它自己)，
+     * 不能用 retryHandler.removeCallbacksAndMessages(null)——retryHandler 还承担
+     * 解码器重试（500ms/800ms）、软解降级、单线路网络重试等既有机制的任务。
+     */
+    private var midPlaybackRecoveryRunnable: Runnable? = null
     // ---------- 换台预加载：焦点频道预热 DNS+TCP 连接，OK 键播放时省握手时间 ----------
     private val preloadHandler = android.os.Handler(android.os.Looper.getMainLooper())
     @Volatile private var preloadUrl: String? = null
@@ -185,10 +201,12 @@ class PlaybackManager(
             // - 播放中途失败（曾成功起播，V1）：先等待 1.5s 原地重试当前线路一次，
             //   重试仍失败才标记本轮恢复失败并交回 autoFail() 继续尝试下一条线路。
             if (!isDecoderError && currentSources.size > 1) {
-                // V1：中途断流 → 先给当前线路一次原地恢复机会（每条线路每次中断只重试一次）
+                // V1.1：中途断流 → 先给当前线路唯一一次原地恢复机会；
+                // 机会已用光（本线路驻留周期内已恢复过）则 schedule 返回 false，直接走 autoFail()
                 if (hasStartedPlaying && scheduleMidPlaybackRecovery(url)) return
-                // 起播失败，或中途恢复重试仍然失败：统一交回原有 autoFail() 继续换线路
-                finishMidPlaybackRecoveryAsFailed()
+                // 起播失败，或中途恢复重试仍然失败：统一交回原有 autoFail() 继续换线路。
+                // 中途断流触发的 failover，新周期从"发生故障的线路"开始计一圈。
+                finishMidPlaybackRecoveryAsFailed(if (hasStartedPlaying) currentSourceIndex else -1)
                 autoFail("线路 ${currentSourceIndex + 1} 播放失败")
                 return
             }
@@ -466,9 +484,12 @@ class PlaybackManager(
     private fun playCurrentSource() {
         val p = player ?: return
         val url = currentSources.getOrNull(currentSourceIndex) ?: return
-        // 每次开始播放一条线路前，清除上一条线路遗留的重试任务与中途恢复状态：
+        // 每次开始播放一条线路前，清除上一条线路遗留的中途恢复状态：
         // 换台 / 手动换线路后，旧线路的延迟 Runnable 不能再重新播放旧 URL。
         resetMidPlaybackRecovery()
+        // V1.1：真正进入新线路（换台 / 手动换线路 / autoFail 切换）→ 重新给予一次中途恢复机会。
+        // 注意：retryPlay() 只是同一线路的原地恢复，不能重置此标记。
+        midPlaybackRecoveryUsedForCurrentSource = false
         hasStartedPlaying = false
         currentUrl = url
         currentChannelName = currentChannelName ?: url
@@ -500,14 +521,20 @@ class PlaybackManager(
         return true
     }
     /**
-     * 清除中途断流恢复状态，并移除仍在等待的重试任务。
-     * 调用点：开始播放任一线路（playCurrentSource）、恢复成功（STATE_READY）、
-     * 恢复失败（转 autoFail 前）、release()。
+     * 清除中途断流恢复状态，并只移除本机制自己的延迟任务。
+     *
+     * V1.1：不再调用 retryHandler.removeCallbacksAndMessages(null)，
+     * 否则会连带清掉解码重试 / 软解降级 / 单线路网络重试等既有机制的待执行任务。
+     *
+     * 注意：这里**不**清 midPlaybackRecoveryUsedForCurrentSource ——
+     * 恢复成功后本线路不再获得第二次机会，只有真正开始新线路/新频道
+     * （playCurrentSource）才重新给予机会。
      */
     private fun resetMidPlaybackRecovery() {
+        midPlaybackRecoveryRunnable?.let { retryHandler.removeCallbacks(it) }
+        midPlaybackRecoveryRunnable = null
         midPlaybackRecoveryPending = false
         midPlaybackRecoverySourceIndex = -1
-        retryHandler.removeCallbacksAndMessages(null)
     }
     /**
      * V1：播放中途（曾经 STATE_READY 成功起播）发生非解码类错误时，
@@ -518,6 +545,8 @@ class PlaybackManager(
      */
     private fun scheduleMidPlaybackRecovery(url: String?): Boolean {
         if (url == null) return false
+        // V1.1：本线路驻留周期内的唯一一次机会已用掉 → 不再原地恢复，直接交给 autoFail()
+        if (midPlaybackRecoveryUsedForCurrentSource) return false
         // 本线路本轮已安排过一次恢复重试，不再重复安排（避免"只重试一次"被绕过）
         if (midPlaybackRecoveryPending) return false
         val index = currentSourceIndex
@@ -525,17 +554,21 @@ class PlaybackManager(
         resetMidPlaybackRecovery()
         midPlaybackRecoveryPending = true
         midPlaybackRecoverySourceIndex = index
+        // 用掉本线路驻留周期内唯一一次机会（恢复成功也不能恢复该机会）
+        midPlaybackRecoveryUsedForCurrentSource = true
         listener.onPlaybackError("播放中断（线路 ${index + 1}），正在尝试恢复…")
-        retryHandler.postDelayed({
+        val task = Runnable {
             // 作废检查：换台 / 手动换线路 / 已恢复 / 已放弃后，不再重试旧的 URL
-            if (!midPlaybackRecoveryPending) return@postDelayed
-            if (midPlaybackRecoverySourceIndex != index) return@postDelayed
-            if (currentSourceIndex != index) return@postDelayed
-            if (currentUrl != url || currentChannelName != name) return@postDelayed
+            if (!midPlaybackRecoveryPending) return@Runnable
+            if (midPlaybackRecoverySourceIndex != index) return@Runnable
+            if (currentSourceIndex != index) return@Runnable
+            if (currentUrl != url || currentChannelName != name) return@Runnable
             retryPlay(url, name)
             // 恢复重试同样受起播超时保护：一直 buffering 不报错也要切下一条线路
             startSourceTimeout()
-        }, midPlaybackRecoveryDelayMs)
+        }
+        midPlaybackRecoveryRunnable = task
+        retryHandler.postDelayed(task, midPlaybackRecoveryDelayMs)
         return true
     }
     /**
@@ -543,10 +576,18 @@ class PlaybackManager(
      * 把新的自动换源周期起点设为"发生故障的线路"，然后交给原有 autoFail()。
      * 这样 A(故障)→A重试失败→B→C→又回到 A 时会判定"所有线路均失败"并停止，
      * 不会出现 A→B→C→A→B→C 无限循环。
+     *
+     * @param fallbackStartIndex 调用方指定的故障线路（>=0 时生效）。用于"恢复机会已用光"的场景
+     *        （此时 pending 已清、midPlaybackRecoverySourceIndex 为 -1，只能由调用方给出当前线路）。
      */
-    private fun finishMidPlaybackRecoveryAsFailed() {
-        if (midPlaybackRecoveryPending && midPlaybackRecoverySourceIndex >= 0) {
-            autoTryStartIndex = midPlaybackRecoverySourceIndex
+    private fun finishMidPlaybackRecoveryAsFailed(fallbackStartIndex: Int = -1) {
+        val startIndex = if (midPlaybackRecoveryPending && midPlaybackRecoverySourceIndex >= 0) {
+            midPlaybackRecoverySourceIndex
+        } else {
+            fallbackStartIndex
+        }
+        if (startIndex >= 0) {
+            autoTryStartIndex = startIndex
         }
         resetMidPlaybackRecovery()
     }
@@ -752,8 +793,10 @@ class PlaybackManager(
     }
 
     fun release() {
-        // V1：清除中途断流恢复状态及其延迟任务（内部也会清 retryHandler）
+        // V1.1：清除中途断流恢复状态及其自己的延迟任务
         resetMidPlaybackRecovery()
+        midPlaybackRecoveryUsedForCurrentSource = false
+        // release 销毁整个 PlaybackManager，此处保留原有的全局清理
         retryHandler.removeCallbacksAndMessages(null)
         sourceTimeoutHandler.removeCallbacksAndMessages(null)
         preloadHandler.removeCallbacksAndMessages(null)
