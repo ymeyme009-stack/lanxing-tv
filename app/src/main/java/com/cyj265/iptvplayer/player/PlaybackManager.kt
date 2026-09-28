@@ -325,6 +325,10 @@ class PlaybackManager(
      * 否则会把后续所有频道都拖进软解（1080p 卡顿、4K 只有声音没图像）。
      */
     private fun degradeToSoftware(url: String, channelName: String) {
+        // V1.2：陈旧延迟任务作废校验（必须在所有副作用之前）。
+        // 换台/换线路后 currentUrl 已经是新频道/新线路，旧的 software-fallback Runnable
+        // 不得再 release 当前播放器、把新频道强制软解、回写旧 URL/name 并播放旧频道。
+        if (currentUrl != url) return
         val pv = playerView ?: return
         player?.removeListener(playerListener)
         player?.release()
@@ -665,6 +669,10 @@ class PlaybackManager(
     }
 
     private fun retryPlay(url: String, channelName: String) {
+        // V1.2：陈旧延迟任务作废校验（必须在 stop/clearMediaItems/setMediaSource 之前）。
+        // 换台/换线路后 currentUrl 已经是新频道/新线路，旧的 decoder retry、
+        // 单线路网络 retry 等延迟任务不得再回放旧 URL 覆盖当前播放。
+        if (currentUrl != url) return
         val p = player ?: return
         hasStartedPlaying = false
         p.stop()
