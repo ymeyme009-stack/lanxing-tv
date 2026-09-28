@@ -56,6 +56,9 @@ import com.cyj265.iptvplayer.player.DecoderHealthCheck
  * - V1.1：同一线路"驻留周期"内只有一次中途恢复机会（恢复成功后再次断流直接切下一条线路，
  *   换台/真正换线路才重新给机会）；中途恢复只移除自己的延迟任务，不影响 retryHandler 上
  *   解码重试 / 软解降级 / 单线路网络重试等既有任务。
+ * - V1.3：引入播放会话 generation（playbackGeneration）。所有带播放副作用的延迟任务
+ *   （decoder retry / 单线路网络 retry / software fallback）创建时捕获、执行前校验，
+ *   换频道/换线路后即使新旧 URL 完全相同也能识别并丢弃旧任务；与 V1.2 的 URL guard 形成纵深防御。
  *
  * 自动识别 HLS / 渐进式流，与 TiviMate 同源的内核家族，对标准 HLS 支持最好。
  *
@@ -96,6 +99,19 @@ class PlaybackManager(
     private val retryHandler = Handler(Looper.getMainLooper())
     private val sourceTimeoutHandler = Handler(Looper.getMainLooper())
     private var sourceTimeoutMs: Long = 10_000L
+    // ---------- V1.3：播放会话 generation ----------
+    /**
+     * 当前"真正播放目标"的会话号（session identity）。
+     * 只有 playCurrentSource() 会推进：换频道 / 换线路 / autoFail 切换 /
+     * 解码方式变更重建播放器，都代表进入新的播放目标。
+     * 同一播放目标内部的恢复行为都不推进：decoder init retry、decoding retry、
+     * 单线路 network retry、V1 mid-playback recovery、software fallback。
+     *
+     * 所有带播放副作用的延迟任务在创建时捕获 generation、执行前校验，
+     * 从而在"新旧 URL 完全相同"的场景下也能识别并丢弃旧任务
+     * （业务字段 URL/name/index 都可能重复，不能充当唯一会话身份）。
+     */
+    private var playbackGeneration = 0L
     // ---------- 播放中途断流恢复（V1 / V1.1） ----------
     /** 中途断流后，原地重试当前线路前的等待时间 */
     private val midPlaybackRecoveryDelayMs = 1_500L
@@ -219,8 +235,13 @@ class PlaybackManager(
                     && decoderInitRetryCount < 1 && url != null) {
                     decoderInitRetryCount++
                     val name = currentChannelName
+                    // V1.3：捕获当前播放会话，换频道/换线路后该延迟重试自动作废
+                    val generation = playbackGeneration
                     listener.onPlaybackError("解码器初始化失败，500ms 后自动重试…")
-                    retryHandler.postDelayed({ retryPlay(url, name ?: url) }, 500)
+                    retryHandler.postDelayed({
+                        if (generation != playbackGeneration) return@postDelayed
+                        retryPlay(url, name ?: url)
+                    }, 500)
                     return
                 }
                 // v1.14.4：解码失败（DECODING_FAILED）自动重试 2 次（延迟800ms）。
@@ -230,8 +251,13 @@ class PlaybackManager(
                     && renderRetryCount < 2 && url != null) {
                     renderRetryCount++
                     val name = currentChannelName
+                    // V1.3：捕获当前播放会话，换频道/换线路后该延迟重试自动作废
+                    val generation = playbackGeneration
                     listener.onPlaybackError("视频渲染失败，${renderRetryCount}/2 自动重试…")
-                    retryHandler.postDelayed({ retryPlay(url, name ?: url) }, 800)
+                    retryHandler.postDelayed({
+                        if (generation != playbackGeneration) return@postDelayed
+                        retryPlay(url, name ?: url)
+                    }, 800)
                     return
                 }
                 // 已降级过软解仍失败：说明软解也放不了（N1 软解 4K HEVC 撑不住），
@@ -246,6 +272,9 @@ class PlaybackManager(
                 if (decoderMode == "auto" && url != null) {
                     degradedToSoftware = true // 防重复进入检测流程
                     val name = currentChannelName
+                    // V1.3：捕获当前播放会话。换频道/换线路后即使 URL 完全相同，
+                    // 该延迟任务也不得 release 新播放器 / 强制软解 / 回写旧频道名。
+                    val generation = playbackGeneration
                     listener.onPlaybackError("硬解失败，正在检测解码器状态…")
                     Thread {
                         val broken = !DecoderHealthCheck.isHardwareHevcHealthy()
@@ -254,7 +283,10 @@ class PlaybackManager(
                                 if (broken) "解码器异常，请重启机顶盒后重试（已临时切换软解）"
                                 else "硬解失败，已切换软件解码"
                             )
-                            retryHandler.postDelayed({ degradeToSoftware(url, name ?: url) }, 800)
+                            retryHandler.postDelayed({
+                                if (generation != playbackGeneration) return@postDelayed
+                                degradeToSoftware(url, name ?: url)
+                            }, 800)
                         }
                     }.start()
                     return
@@ -270,8 +302,13 @@ class PlaybackManager(
                 retryCount++
                 val delay = 1500L * retryCount
                 val name = currentChannelName
+                // V1.3：捕获当前播放会话，换频道/换线路后该延迟重试自动作废
+                val generation = playbackGeneration
                 listener.onPlaybackError("播放失败，${retryCount} 秒后自动重试…")
-                retryHandler.postDelayed({ retryPlay(url, name ?: url) }, delay)
+                retryHandler.postDelayed({
+                    if (generation != playbackGeneration) return@postDelayed
+                    retryPlay(url, name ?: url)
+                }, delay)
                 return
             }
             retryCount = 0
@@ -488,6 +525,11 @@ class PlaybackManager(
     private fun playCurrentSource() {
         val p = player ?: return
         val url = currentSources.getOrNull(currentSourceIndex) ?: return
+        // V1.3：这里是唯一代表"进入新播放目标"的入口（换频道 / 换线路 / autoFail 切换 /
+        // 解码方式变更重建播放器）。推进 generation 后，此前捕获旧 generation 的延迟任务全部失效。
+        // 注意：所有"同一目标内的重试"（retryPlay / degradeToSoftware）都不经过这里，
+        // 因此合法 retry 不会因 generation 变化被自己作废。
+        playbackGeneration++
         // 每次开始播放一条线路前，清除上一条线路遗留的中途恢复状态：
         // 换台 / 手动换线路后，旧线路的延迟 Runnable 不能再重新播放旧 URL。
         resetMidPlaybackRecovery()
